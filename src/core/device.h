@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/arch.h"
+
 #include <cuda_runtime.h>
 
 #include <cstddef>
@@ -23,6 +25,9 @@ struct DeviceContext {
     cudaStream_t stream          = nullptr;
     cudaStream_t transfer_stream = nullptr;
     cudaDeviceProp props{};
+    // Features of this device resolved once from props; host launch policy, route selection,
+    // KV storage validation, and plan sizing read these instead of re-deriving them.
+    arch::Features features_{};
 
     explicit DeviceContext(int device_id = 0);
     ~DeviceContext();
@@ -36,9 +41,15 @@ struct DeviceContext {
     void bind_to_current_thread_noexcept() const noexcept;
     int compute_capability() const noexcept;
     int multiprocessor_count() const noexcept;
+    [[nodiscard]] const arch::Features& features() const noexcept { return features_; }
     DeviceExecutionView execution_view() const noexcept;
     std::size_t total_vram() const noexcept;
     void synchronize() const;
+
+    // Ordinal of the first CUDA device whose architecture this binary was compiled for, or a
+    // descriptive failure when no device matches. Lets one universal binary run on hosts with
+    // mixed Nvidia generations without hardcoding an ordinal.
+    [[nodiscard]] static int preferred_device_id();
 };
 
 class CudaEventTimer {

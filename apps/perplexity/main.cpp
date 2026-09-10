@@ -46,7 +46,7 @@ struct Options {
     std::optional<std::filesystem::path> output;
     std::uint32_t context               = 4096;
     std::uint32_t stride                = 2048;
-    int device                          = 0;
+    int device                          = -1; // -1 = first GPU this build targets (auto).
     ninfer::KvCacheStorage kv           = ninfer::KvCacheStorage::Fp8E4M3Row256;
     bool quick                          = false;
     ninfer::product::LogLevel log_level = ninfer::product::LogLevel::Info;
@@ -163,7 +163,11 @@ std::string safe_component(std::string_view value) {
 std::string timestamp() {
     const std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
     std::tm utc{};
+#if defined(_WIN32)
+    gmtime_s(&utc, &now);
+#else
     gmtime_r(&now, &utc);
+#endif
     std::ostringstream out;
     out << std::put_time(&utc, "%Y%m%d-%H%M%S");
     return out.str();

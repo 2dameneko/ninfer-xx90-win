@@ -51,6 +51,62 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
         CUDA_CHECK(cudaGetLastError());
         return;
     }
+    if (cache.storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
+        cache.storage == KvCacheStorage::RotatedInt4KeyInt4ValueGroup64 ||
+        cache.storage == KvCacheStorage::RK4V4E8 ||
+        cache.storage == KvCacheStorage::RK2V4E8) {
+        const KVCacheStorageFlags flags = kv_cache_storage_flags(cache.storage);
+        Tensor& cache_k_scale           = cache.k_scale_pages;
+        Tensor& cache_v_scale           = cache.v_scale_pages;
+        const auto launch_rk = [&]<bool PackedV, bool RotateK, bool RotateV, bool PackedK,
+                                     bool E8Lattice, bool E8Root>() {
+            if (tokens >= 32) {
+                constexpr int TokensPerTile = 8;
+                const int max_tiles =
+                    static_cast<int>(div_up(tokens + TokensPerTile, TokensPerTile));
+                const dim3 fill_grid(static_cast<unsigned>(max_tiles),
+                                     static_cast<unsigned>(Geometry::KVHeads),
+                                     static_cast<unsigned>(kKVCacheInt8Groups));
+                kv_cache_append_full_rk_page_kernel<Geometry, PackedV, RotateK, RotateV, PackedK,
+                                                    E8Lattice, E8Root, Metadata>
+                    <<<fill_grid, kBlock, 0, stream>>>(
+                        static_cast<const __nv_bfloat16*>(k.data),
+                        static_cast<const __nv_bfloat16*>(v.data),
+                        static_cast<const std::int32_t*>(positions.data), metadata,
+                        static_cast<std::int8_t*>(cache_k.data),
+                        static_cast<std::uint8_t*>(cache_v.data),
+                        static_cast<__half*>(cache_k_scale.data),
+                        static_cast<__half*>(cache_v_scale.data), tokens);
+            } else {
+                constexpr int FillWarps = kBlock / 32;
+                const std::int64_t fill_units =
+                    static_cast<std::int64_t>(tokens) * Geometry::KVHeads * kKVCacheInt8Groups;
+                const int fill_grid =
+                    static_cast<int>(div_up(fill_units, static_cast<std::int64_t>(FillWarps)));
+                kv_cache_append_full_rk_kernel<Geometry, PackedV, RotateK, RotateV, PackedK,
+                                               E8Lattice, E8Root, Metadata>
+                    <<<fill_grid, kBlock, 0, stream>>>(
+                        static_cast<const __nv_bfloat16*>(k.data),
+                        static_cast<const __nv_bfloat16*>(v.data),
+                        static_cast<const std::int32_t*>(positions.data), metadata,
+                        static_cast<std::int8_t*>(cache_k.data),
+                        static_cast<std::uint8_t*>(cache_v.data),
+                        static_cast<__half*>(cache_k_scale.data),
+                        static_cast<__half*>(cache_v_scale.data), tokens);
+            }
+        };
+        if (flags.e8_root) {
+            launch_rk.template operator()<true, true, true, false, false, true>();
+        } else if (flags.e8_lattice) {
+            launch_rk.template operator()<true, true, true, true, true, false>();
+        } else if (flags.packed_k) {
+            launch_rk.template operator()<true, true, true, true, false, false>();
+        } else {
+            launch_rk.template operator()<true, true, true, false, false, false>();
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     if (cache.storage == KvCacheStorage::Int8Group64) {
         Tensor& cache_k_scale = cache.k_scale_pages;
         Tensor& cache_v_scale = cache.v_scale_pages;

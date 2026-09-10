@@ -41,7 +41,7 @@ struct ServeOptions {
     std::uint32_t media_preprocess_threads = 0;
     std::size_t response_store_max_records = kDefaultResponseStoreRecords;
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
-    int device                             = 0;
+    int device                             = -1; // -1 auto-selects the first baked-arch device.
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     ContextCacheOptions context_cache;

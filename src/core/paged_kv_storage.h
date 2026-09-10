@@ -87,6 +87,35 @@ struct PagedKVStorageLayout {
                     {DType::U8, 128, DType::U8, 16}};
         }
         break;
+    // Rotated/packed KV modes (fork port from the RTX 4090 branch). K and V are rotated per
+    // 64-group by an H64 transform before encoding; packed planes hold two signed 4-bit codes
+    // per byte (E8-root keys hold two E8 root code bytes per two dimensions). The scale plane is
+    // one FP16 per 64-group in every mode.
+    case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
+        if (head_dim == kD256KVCacheHeadDim) {
+            return {storage,
+                    head_dim,
+                    {DType::I8, 256, DType::FP16, 4},
+                    {DType::U8, 128, DType::FP16, 4}};
+        }
+        break;
+    case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
+    case KvCacheStorage::RK4V4E8:
+        if (head_dim == kD256KVCacheHeadDim) {
+            return {storage,
+                    head_dim,
+                    {DType::U8, 128, DType::FP16, 4},
+                    {DType::U8, 128, DType::FP16, 4}};
+        }
+        break;
+    case KvCacheStorage::RK2V4E8:
+        if (head_dim == kD256KVCacheHeadDim) {
+            return {storage,
+                    head_dim,
+                    {DType::U8, 64, DType::FP16, 4},
+                    {DType::U8, 128, DType::FP16, 4}};
+        }
+        break;
     }
     throw std::invalid_argument("unsupported paged KV-cache storage geometry");
 }

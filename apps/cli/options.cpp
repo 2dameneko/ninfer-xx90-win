@@ -58,6 +58,10 @@ KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "fp8") { return KvCacheStorage::Fp8E4M3Row256; }
     if (text == "nvfp4") { return KvCacheStorage::Nvfp4Group16; }
     if (text == "k8v4") { return KvCacheStorage::Fp8KeyNvfp4Value; }
+    if (text == "rk8v4") { return KvCacheStorage::RotatedInt8KeyInt4ValueGroup64; }
+    if (text == "rk4v4") { return KvCacheStorage::RotatedInt4KeyInt4ValueGroup64; }
+    if (text == "rk4v4-e8") { return KvCacheStorage::RK4V4E8; }
+    if (text == "rk2v4-e8") { return KvCacheStorage::RK2V4E8; }
     throw std::invalid_argument("invalid kv-dtype: " + std::string(text));
 }
 
@@ -79,8 +83,8 @@ std::string usage_text(const char* argv0) {
     return std::string("usage: ") + argv0 +
            " <model.ninfer> (--prompt <text>|--messages <messages.json>)\n"
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
-           "       [--device N]\n"
-           "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash|dflash2 --draft-tokens "
+           "       [--device N]\n"   // omitted = first GPU this build targets
+           "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8] [--spec mtp|dflash|dflash2 --draft-tokens "
            "N]\n"
            "       [--lm-head-draft]\n"
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
@@ -101,7 +105,9 @@ std::string usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom.\n"
            "Sampling defaults come from the loaded model and thinking mode; flags override "
-           "individual fields.\n";
+           "individual fields.\n"
+            "--device selects the CUDA ordinal; when omitted, the first GPU whose architecture "
+            "this build targets is used.\n";
 }
 
 Options parse_options(int argc, char** argv) {

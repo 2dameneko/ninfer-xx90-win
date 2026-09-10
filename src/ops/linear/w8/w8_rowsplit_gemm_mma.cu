@@ -1,6 +1,7 @@
 #include "ops/linear/w8/w8_rowsplit_gemm_mma.cuh"
 
 #include "core/device.h"
+#include "core/device_capability.h"
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
 #include "ops/linear/w8/w8_launch.h"
@@ -20,7 +21,18 @@ void launch_slice(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t st
     const dim3 grid(static_cast<unsigned>(div_up(rows, Schedule::BM)),
                     static_cast<unsigned>(div_up(cols, Schedule::BN)), 1u);
     const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), rows};
-    w8_rowsplit_gemm_mma_kernel<Schedule, Full><<<grid, Schedule::THREADS, 0, stream>>>(
+    const std::size_t dynamic_shared = core::dynamic_shared_carveout(Schedule::SMEM_BYTES);
+    if (dynamic_shared != 0) {
+        static const bool carveout_ok = [] {
+            return cudaFuncSetAttribute(w8_rowsplit_gemm_mma_kernel<Schedule, Full>,
+                                        cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        static_cast<int>(Schedule::SMEM_BYTES)) == cudaSuccess;
+        }();
+        if (!carveout_ok) {
+            throw std::runtime_error("W8 rowsplit shared-memory carveout is unavailable");
+        }
+    }
+    w8_rowsplit_gemm_mma_kernel<Schedule, Full><<<grid, Schedule::THREADS, dynamic_shared, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
         static_cast<const std::uint8_t*>(w.scales), output, rows, k, cols, padded_k);
     CUDA_CHECK(cudaGetLastError());

@@ -1,4 +1,7 @@
 #include "core/device.h"
+#include "core/device.h"
+#include "core/pdl.cuh"
+
 
 #include <cstdio>
 #include <cstdlib>
@@ -11,6 +14,33 @@ namespace {
 
 std::string cuda_error_message(const char* prefix, cudaError_t err) {
     return std::string(prefix) + ": " + cudaGetErrorName(err) + ": " + cudaGetErrorString(err);
+}
+
+std::string describe_baked_capabilities() {
+    std::string out;
+    const auto add = [&out](std::uint32_t bit, const char* label) {
+        if (arch::kBakedCapabilities & bit) {
+            if (!out.empty()) { out += ", "; }
+            out += label;
+        }
+    };
+    add(arch::kBit86, "sm_86 (Ampere)");
+    add(arch::kBit89, "sm_89 (Ada)");
+    add(arch::kBit120, "sm_120a (Blackwell)");
+    if (out.empty()) { out = "(none)"; }
+    return out;
+}
+
+std::string unsupported_device_message(int device_id) {
+    cudaDeviceProp props{};
+    (void)cudaGetDeviceProperties(&props, device_id);
+    const std::string name = props.name;
+    const int cc           = props.major * 10 + props.minor;
+    return "CUDA device " + std::to_string(device_id) + " (" + name + ", compute capability " +
+           std::to_string(cc / 10) + "." + std::to_string(cc % 10) +
+           ") is not built into this binary; this build targets " + describe_baked_capabilities() +
+           ". Rebuild with -DCMAKE_CUDA_ARCHITECTURES including the card architecture "
+           "(86-real, 89-real, 120a) or run on a matching GPU.";
 }
 
 void log_cuda_error(const char* op, cudaError_t err) noexcept {
@@ -59,6 +89,15 @@ DeviceContext::DeviceContext(int device_id) : device(device_id) {
         throw std::runtime_error(cuda_error_message("cudaGetDeviceProperties failed", err));
     }
 
+    const std::int32_t capability = props.major * 10 + props.minor;
+    if (!arch::capability_baked(capability)) {
+        throw std::runtime_error(unsupported_device_message(device_id));
+    }
+    features_ = arch::features_for(capability);
+    // The PDL host launch policy follows the attached device (see core/pdl.cuh).
+    pdl::set_programmatic_launch_enabled(features_.pdl);
+
+
     cudaStream_t compute = nullptr;
     cudaStream_t load    = nullptr;
     err                  = cudaStreamCreateWithFlags(&compute, cudaStreamNonBlocking);
@@ -86,7 +125,7 @@ DeviceContext::~DeviceContext() {
 
 DeviceContext::DeviceContext(DeviceContext&& other) noexcept
     : device(other.device), stream(other.stream), transfer_stream(other.transfer_stream),
-      props(other.props) {
+      props(other.props), features_(other.features_) {
     other.stream          = nullptr;
     other.transfer_stream = nullptr;
 }
@@ -102,6 +141,7 @@ DeviceContext& DeviceContext::operator=(DeviceContext&& other) noexcept {
     props           = other.props;
     stream          = other.stream;
     transfer_stream = other.transfer_stream;
+    features_       = other.features_;
 
     other.stream          = nullptr;
     other.transfer_stream = nullptr;
@@ -120,6 +160,39 @@ void DeviceContext::bind_to_current_thread_noexcept() const noexcept {
 }
 
 int DeviceContext::compute_capability() const noexcept { return props.major * 10 + props.minor; }
+
+int DeviceContext::preferred_device_id() {
+    int count = 0;
+    cudaError_t err = cudaGetDeviceCount(&count);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaGetDeviceCount failed", err));
+    }
+    if (count <= 0) { throw std::runtime_error("no CUDA devices available"); }
+    // A universal binary can run on several attached GPUs at once; auto-selection prefers the
+    // strongest capability, then the largest memory, then the lowest ordinal.
+    int best_id          = -1;
+    std::int32_t best_cap = -1;
+    std::size_t best_vram = 0;
+    for (int id = 0; id < count; ++id) {
+        cudaDeviceProp probe{};
+        const cudaError_t probe_err = cudaGetDeviceProperties(&probe, id);
+        if (probe_err != cudaSuccess) { continue; }
+        const std::int32_t capability = probe.major * 10 + probe.minor;
+        if (!arch::capability_baked(capability)) { continue; }
+        const std::size_t vram = probe.totalGlobalMem;
+        if (best_id < 0 || capability > best_cap ||
+            (capability == best_cap && vram > best_vram)) {
+            best_id   = id;
+            best_cap  = capability;
+            best_vram = vram;
+        }
+    }
+    if (best_id < 0) {
+        throw std::runtime_error(
+            "no CUDA device matches this build's architectures: " + describe_baked_capabilities());
+    }
+    return best_id;
+}
 
 int DeviceContext::multiprocessor_count() const noexcept { return props.multiProcessorCount; }
 

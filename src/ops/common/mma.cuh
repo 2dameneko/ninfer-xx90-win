@@ -59,10 +59,22 @@ __device__ __forceinline__ void mma_s8(int& c0, int& c1, int& c2, int& c3, unsig
 __device__ __forceinline__ void mma_fp8_e4m3(float& c0, float& c1, float& c2, float& c3,
                                              unsigned a0, unsigned a1, unsigned a2, unsigned a3,
                                              unsigned b0, unsigned b1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
     asm volatile("mma.sync.aligned.kind::f8f6f4.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
                  : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+    // The .kind::f8f6f4 qualifier requires sm_120; sm_89 (Ada) assembles the plain e4m3 form.
+    asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#else
+    // Ampere (sm_86) has no FP8 tensor-core instruction at all. Host plans reject every FP8
+    // tensor-core route on such devices; trap loudly rather than silently corrupt if reached.
+    __trap();
+#endif
 }
 
 __device__ __forceinline__ void mma_tf32_bits(float& c0, float& c1, float& c2, float& c3,
@@ -84,6 +96,7 @@ __device__ __forceinline__ void mma_nvfp4_e4m3(float& c0, float& c1, float& c2, 
                                                unsigned a0, unsigned a1, unsigned a2, unsigned a3,
                                                unsigned b0, unsigned b1, unsigned sfa,
                                                unsigned sfb) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
     constexpr unsigned short kScaleBlockId  = 0;
     constexpr unsigned short kScaleThreadId = 0;
     asm volatile("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X."
@@ -100,6 +113,13 @@ __device__ __forceinline__ void mma_nvfp4_e4m3(float& c0, float& c1, float& c2, 
                  : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(sfa),
                    "h"(kScaleBlockId), "h"(kScaleThreadId), "r"(sfb), "h"(kScaleBlockId),
                    "h"(kScaleThreadId));
+#else
+    // The .kind::mxf4nvf4 block-scale MMA (FP4 tensor cores) is Blackwell-only (sm_120a); it is
+    // not encodable on sm_86/89. NVFP4 routes are rejected by the host feature table on those
+    // devices and their launchers throw before any kernel starts; trap loudly if reached.
+    __trap();
+#endif
 }
 
 } // namespace ninfer::ops
+

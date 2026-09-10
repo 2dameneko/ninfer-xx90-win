@@ -82,10 +82,28 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void w8_rowsplit_gem
     static_assert(!kSwiGlu || Cfg::WARPS_M == 1 || Cfg::WARPS_M == 2,
                   "SwiGLU supports warp-local or shared-memory row pairing");
 
-    __shared__ __align__(16) __nv_bfloat16 As[BM * BK];
-    __shared__ __align__(16) __nv_bfloat16 Bs[Cfg::ACTIVATION_STAGES][BN * BK];
-    __shared__ __align__(16) std::uint8_t Cr[BM * BK];
-    __shared__ __align__(16) std::uint8_t Sr[BM * Cfg::SCALE_CACHE_BYTES];
+    // Pre-Blackwell passes: instantiations above the 49152-byte static shared limit use the
+    // dynamic carveout (host launchers pass Cfg::SMEM_BYTES, see core::dynamic_shared_carveout).
+    struct alignas(16) RowsplitSmem {
+        __nv_bfloat16 As[BM * BK];
+        __nv_bfloat16 Bs[Cfg::ACTIVATION_STAGES][BN * BK];
+        std::uint8_t Cr[BM * BK];
+        std::uint8_t Sr[BM * Cfg::SCALE_CACHE_BYTES];
+    };
+    static_assert(sizeof(RowsplitSmem) == Cfg::SMEM_BYTES, "rowsplit smem layout is packed");
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 1200
+    constexpr bool kPreBlackwellDynamic = Cfg::SMEM_BYTES > 49152;
+#else
+    constexpr bool kPreBlackwellDynamic = false;
+#endif
+    __shared__ __align__(16) unsigned char rowsplit_smem_static[kPreBlackwellDynamic ? 1 : Cfg::SMEM_BYTES];
+    extern __shared__ __align__(16) unsigned char rowsplit_smem_dynamic[];
+    auto& smem = *reinterpret_cast<RowsplitSmem*>(
+        kPreBlackwellDynamic ? rowsplit_smem_dynamic : rowsplit_smem_static);
+    auto& As   = smem.As;
+    auto& Bs   = smem.Bs;
+    auto& Cr   = smem.Cr;
+    auto& Sr   = smem.Sr;
 
     const int tid  = static_cast<int>(threadIdx.x);
     const int warp = tid >> 5;

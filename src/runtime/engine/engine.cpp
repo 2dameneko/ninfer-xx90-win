@@ -92,7 +92,11 @@ EngineOptions normalize_engine_options(EngineOptions options) {
 
 DeviceContext initialize_device(const EngineOptions& options) {
     StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaInitialize);
-    DeviceContext device(options.device);
+    // device == -1 (the default) auto-selects the first device whose architecture this binary
+    // was compiled for, so one universal build runs on mixed-generation hosts.
+    const int device_id =
+        options.device >= 0 ? options.device : DeviceContext::preferred_device_id();
+    DeviceContext device(device_id);
     phase.complete();
     return device;
 }

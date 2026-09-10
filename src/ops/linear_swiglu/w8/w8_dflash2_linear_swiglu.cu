@@ -1,6 +1,7 @@
 #include "ops/linear_swiglu/w8/w8_linear_swiglu_kernels.h"
 
 #include "core/device.h"
+#include "core/device_capability.h"
 #include "ops/linear/w8/w8_config.h"
 #include "ops/linear/w8/w8_rowsplit_output.cuh"
 #include "ops/linear/w8/w8_small_t_mma.cuh"
@@ -32,9 +33,23 @@ void launch_tile(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_
     const W8SwiGluDirectEpilogue epilogue{static_cast<__nv_bfloat16*>(out.data), kIntermediate};
     const RowPolicy row_policy{};
     constexpr int kBlocks = kIntermediate / RowPolicy::kOutputRowsPerCta;
+    const std::size_t dynamic_shared = core::dynamic_shared_carveout(
+        sizeof(W8SmallTMmaSharedStorage<Schedule>));
+    if (dynamic_shared != 0) {
+        static const bool carveout_ok = [] {
+            return cudaFuncSetAttribute(
+                       w8_small_t_mma_kernel<Geometry, Capacity, Schedule, W8ContiguousOutput,
+                                             W8SwiGluDirectEpilogue, RowPolicy, true, true>,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       static_cast<int>(sizeof(W8SmallTMmaSharedStorage<Schedule>))) == cudaSuccess;
+        }();
+        if (!carveout_ok) {
+            throw std::runtime_error("W8 small-T shared-memory carveout is unavailable");
+        }
+    }
     w8_small_t_mma_kernel<Geometry, Capacity, Schedule, W8ContiguousOutput,
                           W8SwiGluDirectEpilogue, RowPolicy, true, true>
-        <<<kBlocks, Schedule::kThreads, 0, stream>>>(
+        <<<kBlocks, Schedule::kThreads, dynamic_shared, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), ignored_output, epilogue, row_policy, x.ne[1]);

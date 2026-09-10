@@ -1,15 +1,21 @@
 #pragma once
 
-// INT8-cache causal prompt kernel for the registered head geometries. Q and cached K use the same
-// fixed register-only D256 rotation before their private G64 encoders. QK stays INT8 through
+// INT8-native GQA prompt kernel for the registered head geometries. QK stays INT8 through
 // m16n8k32.s8 Tensor Cores; V alone is dequantized with packed FP16 arithmetic while
 // producer warps execute QK. Sixteen warps split each 16-row FP16 PV output across
 // four 64-dimension slices.
+//
+// RK/E8 storage modes read cached K through the matching codec (packed 4-bit, E8-root) and
+// skip the plain-int8 D256 Q rotation in favour of the per-group H64 transform that the
+// append side applied. The lattice variant stores projected 4-bit codes, so its reads are
+// identical to the plain packed path.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <math_constants.h>
 
+#include "ops/kernel/e8_lattice.cuh"
+#include "ops/kernel/e8_root_codec.cuh"
 #include "ops/kv_cache/int8_g64_codec.cuh"
 #include "ops/softmax_attention/dense/causal_cache/prompt_common.cuh"
 
@@ -65,10 +71,11 @@ __device__ __forceinline__ int4 causal_prompt_i8_dequant_f16x8(const std::int8_t
                      static_cast<int>(packed[2]), static_cast<int>(packed[3]));
 }
 
-template <typename Geometry, typename Metadata>
+template <typename Geometry, bool PackedV, bool RotateK, bool RotateV, bool PackedK, bool E8Root,
+          typename Metadata>
 __global__ __maxnreg__(120) void causal_attention_prompt_i8_kernel(
     const __nv_bfloat16* __restrict__ q, const std::int8_t* __restrict__ cache_k,
-    const std::int8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
+    const std::uint8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
     const __half* __restrict__ cache_v_scale, Metadata metadata,
     const std::int32_t* __restrict__ positions, float scale, __nv_bfloat16* __restrict__ out,
     std::int32_t width) {
@@ -129,6 +136,7 @@ __global__ __maxnreg__(120) void causal_attention_prompt_i8_kernel(
     const int key_blocks    = max_query_abs / Bc + 1;
 
     // Quantize Q cooperatively. One full warp rotates and encodes one D256 row at a time.
+    // RK modes replace the D256 butterfly with the per-group H64 pair rotation applied to K.
     for (int row = warp; row < Br; row += kCausalPromptI8Warps) {
         float q_values[8];
 #pragma unroll
@@ -140,14 +148,15 @@ __global__ __maxnreg__(120) void causal_attention_prompt_i8_kernel(
                     __bfloat162float(q[causal_prompt_q_index<Geometry>(q_head, d, q0 + row)]);
             }
         }
-        normalized_hadamard_d256_inplace(q_values, lane);
+        if constexpr (!RotateK) { normalized_hadamard_d256_inplace(q_values, lane); }
 
 #pragma unroll
         for (int grp = 0; grp < Groups; ++grp) {
             const int d0    = grp * kKVCacheInt8Group + lane;
             const int d1    = d0 + 32;
-            const float x0  = q_values[2 * grp];
-            const float x1  = q_values[2 * grp + 1];
+            float x0        = q_values[2 * grp];
+            float x1        = q_values[2 * grp + 1];
+            if constexpr (RotateK) { kv_cache_hadamard64(x0, x1, FullMask); }
             float absmax    = fmaxf(fabsf(x0), fabsf(x1));
             absmax          = warp_max(absmax, FullMask);
             const float qs  = absmax > 0.0f ? absmax / 127.0f : 0.0f;
@@ -184,10 +193,44 @@ __global__ __maxnreg__(120) void causal_attention_prompt_i8_kernel(
             std::int8_t* kd = &k_i8[(key_l * DB16 + causal_prompt_swz(key_l, dc * 8)) * 2];
             std::int8_t* vd = &v_i8[key_l * D + d];
             if (key <= max_query_abs) {
-                const std::int64_t off =
-                    kv_cache_int8_quant_code_index<Geometry>(physical_page, kv_head, d, key_l);
-                cp_async<16, Cache::cg>(kd, &cache_k[off]);
-                cp_async<16, Cache::cg>(vd, &cache_v[off]);
+                if constexpr (E8Root) {
+                    const std::int64_t koff = paged_kv_page_head_offset<64, Geometry::KVHeads>(
+                        physical_page, kv_head) + static_cast<std::int64_t>(key_l) * 64 + (d / 4);
+                    const uint32_t src4 = *reinterpret_cast<const uint32_t*>(
+                        &reinterpret_cast<const std::uint8_t*>(cache_k)[koff]);
+                    const uint8_t c1_0 = static_cast<uint8_t>(src4 & 0xFF);
+                    const uint8_t c2_0 = static_cast<uint8_t>((src4 >> 8) & 0xFF);
+                    const uint8_t c1_1 = static_cast<uint8_t>((src4 >> 16) & 0xFF);
+                    const uint8_t c2_1 = static_cast<uint8_t>((src4 >> 24) & 0xFF);
+                    int8_t dec8_0[8], dec8_1[8];
+                    e8_root_decode_8d_int8(c1_0, c2_0, dec8_0);
+                    e8_root_decode_8d_int8(c1_1, c2_1, dec8_1);
+                    *reinterpret_cast<uint64_t*>(&kd[0]) = *reinterpret_cast<const uint64_t*>(dec8_0);
+                    *reinterpret_cast<uint64_t*>(&kd[8]) = *reinterpret_cast<const uint64_t*>(dec8_1);
+                    const std::int64_t voff =
+                        kv_cache_i4_code_index<Geometry>(physical_page, kv_head, d / 2, key_l);
+                    kv_cache_unpack_i4x16(&cache_v[voff], vd);
+                } else if constexpr (PackedK) {
+                    const std::int64_t koff =
+                        kv_cache_i4_code_index<Geometry>(physical_page, kv_head, d / 2, key_l);
+                    kv_cache_unpack_i4x16(&reinterpret_cast<const std::uint8_t*>(cache_k)[koff],
+                                          kd);
+                    const std::int64_t voff =
+                        kv_cache_i4_code_index<Geometry>(physical_page, kv_head, d / 2, key_l);
+                    kv_cache_unpack_i4x16(&cache_v[voff], vd);
+                } else {
+                    const std::int64_t off =
+                        kv_cache_int8_quant_code_index<Geometry>(physical_page, kv_head, d, key_l);
+                    cp_async<16, Cache::cg>(kd, &cache_k[off]);
+                    if constexpr (PackedV) {
+                        const std::int64_t voff = kv_cache_i4_code_index<Geometry>(
+                            physical_page, kv_head, d / 2, key_l);
+                        kv_cache_unpack_i4x16(&cache_v[voff], vd);
+                    } else {
+                        cp_async<16, Cache::cg>(
+                            vd, &reinterpret_cast<const std::int8_t*>(cache_v)[off]);
+                    }
+                }
             } else {
                 store_vec(kd, make_int4(0, 0, 0, 0));
                 store_vec(vd, make_int4(0, 0, 0, 0));

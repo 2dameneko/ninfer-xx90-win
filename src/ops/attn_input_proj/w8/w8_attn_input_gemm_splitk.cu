@@ -1,6 +1,7 @@
 #include "ops/attn_input_proj/w8/w8_attn_input_kernels.h"
 
 #include "core/device.h"
+#include "core/device_capability.h"
 #include "ops/linear/w8/w8_small_t_mma.cuh"
 #include "ops/linear/w8/w8_rowsplit_gemm_medium_t_splitk.cuh"
 
@@ -36,8 +37,21 @@ void launch_output(const Tensor& x, const Weight& weight, Output output, cudaStr
                                                 : 48;
     using Geometry         = W8LinearGeometry<Rows, kHidden>;
     using Schedule         = W8SmallTMmaDefaultSchedule<TileCols, ActiveCols>;
+    const std::size_t dynamic_shared = core::dynamic_shared_carveout(
+        sizeof(W8SmallTMmaSharedStorage<Schedule>));
+    if (dynamic_shared != 0) {
+        static const bool carveout_ok = [] {
+            return cudaFuncSetAttribute(
+                       w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule, Output>,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       static_cast<int>(sizeof(W8SmallTMmaSharedStorage<Schedule>))) == cudaSuccess;
+        }();
+        if (!carveout_ok) {
+            throw std::runtime_error("W8 small-T shared-memory carveout is unavailable");
+        }
+    }
     w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule>
-        <<<Rows / kRowsPerCta, Schedule::kThreads, 0, stream>>>(
+        <<<Rows / kRowsPerCta, Schedule::kThreads, dynamic_shared, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), output);
@@ -117,6 +131,24 @@ void w8_attn_input_splitk_mma_launch(const Tensor& x, const Weight& weight, Tens
     }
     if (x.ne[1] <= kLastTargetExactCols) {
         kTargetLaunchers[x.ne[1] - kFirstExactCols](x, weight, q, gate, k, v, stream);
+    } else if (!core::device_supports_sm100_or_newer()) {
+        // Pre-Blackwell SASS has no medium split-K kernels (48KB per-block shared-memory limit);
+        // 32-column exact-T chunking covers T=49..64 without a one-column tail.
+        std::int32_t offset = 0;
+        while (x.ne[1] - offset >= 2) {
+            std::int32_t count = x.ne[1] - offset < 32 ? x.ne[1] - offset : 32;
+            if (x.ne[1] - offset - count == 1) {
+                --count;
+            }
+            const Tensor x_slice = x.slice(1, offset, count);
+            Tensor q_slice        = q.slice(1, offset, count);
+            Tensor gate_slice     = gate.slice(1, offset, count);
+            Tensor k_slice        = k.slice(1, offset, count);
+            Tensor v_slice        = v.slice(1, offset, count);
+            kTargetLaunchers[count - kFirstExactCols](x_slice, weight, q_slice, gate_slice, k_slice,
+                                                      v_slice, stream);
+            offset += count;
+        }
     } else {
         launch_target_medium_cols<64, 4, 2, 2>(x, weight, q, gate, k, v, stream);
     }
@@ -130,6 +162,22 @@ void w8_attn_input_splitk_mma_launch(const Tensor& x, const Weight& weight, Tens
     }
     if (x.ne[1] <= kLastCompanionExactCols) {
         kCompanionLaunchers[x.ne[1] - kFirstExactCols](x, weight, q, k, v, stream);
+    } else if (!core::device_supports_sm100_or_newer()) {
+        // Pre-Blackwell fallback: 32-column exact-T chunking covers T=33..96.
+        std::int32_t offset = 0;
+        while (x.ne[1] - offset >= 2) {
+            std::int32_t count = x.ne[1] - offset < 32 ? x.ne[1] - offset : 32;
+            if (x.ne[1] - offset - count == 1) {
+                --count;
+            }
+            const Tensor x_slice = x.slice(1, offset, count);
+            Tensor q_slice       = q.slice(1, offset, count);
+            Tensor k_slice       = k.slice(1, offset, count);
+            Tensor v_slice       = v.slice(1, offset, count);
+            kCompanionLaunchers[count - kFirstExactCols](x_slice, weight, q_slice, k_slice, v_slice,
+                                                         stream);
+            offset += count;
+        }
     } else if (x.ne[1] <= 48) {
         launch_companion_medium_cols<48, 4, 2, 3>(x, weight, q, k, v, stream);
     } else if (x.ne[1] <= 64) {

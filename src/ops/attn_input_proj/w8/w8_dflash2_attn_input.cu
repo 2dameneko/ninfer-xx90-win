@@ -1,6 +1,7 @@
 #include "ops/attn_input_proj/w8/w8_attn_input_kernels.h"
 
 #include "core/device.h"
+#include "core/device_capability.h"
 #include "ops/common/math.h"
 #include "ops/common/token_slices.h"
 #include "ops/linear/w8/w8_config.h"
@@ -42,9 +43,24 @@ void launch_small(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, T
     const Output output{static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(k.data),
                         static_cast<__nv_bfloat16*>(v.data)};
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
+    const std::size_t dynamic_shared = core::dynamic_shared_carveout(
+        sizeof(W8SmallTMmaSharedStorage<Schedule>));
+    if (dynamic_shared != 0) {
+        static const bool carveout_ok = [] {
+            return cudaFuncSetAttribute(
+                       w8_small_t_mma_kernel<Geometry, Columns, Schedule, Output,
+                                             W8SmallTMmaStoreEpilogue, W8SmallTMmaIdentityRows,
+                                             false, !Exact>,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       static_cast<int>(sizeof(W8SmallTMmaSharedStorage<Schedule>))) == cudaSuccess;
+        }();
+        if (!carveout_ok) {
+            throw std::runtime_error("W8 small-T shared-memory carveout is unavailable");
+        }
+    }
     w8_small_t_mma_kernel<Geometry, Columns, Schedule, Output, W8SmallTMmaStoreEpilogue,
                           W8SmallTMmaIdentityRows, false, !Exact>
-        <<<kBlocks, Schedule::kThreads, 0, stream>>>(
+        <<<kBlocks, Schedule::kThreads, dynamic_shared, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), output, W8SmallTMmaStoreEpilogue{},
@@ -69,8 +85,20 @@ void launch_mma_slice(const Tensor& x, const Weight& weight, Tensor& q, Tensor& 
                         static_cast<__nv_bfloat16*>(v.data)};
     const dim3 grid(Geometry::kOutputRows / Schedule::BM,
                     static_cast<unsigned>(div_up(x.ne[1], Schedule::BN)), 1u);
+    const std::size_t dynamic_shared = core::dynamic_shared_carveout(Schedule::SMEM_BYTES);
+    if (dynamic_shared != 0) {
+        static const bool carveout_ok = [] {
+            return cudaFuncSetAttribute(
+                       w8_rowsplit_gemm_mma_kernel<Schedule, Full, W8Epilogue::Store, Output>,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       static_cast<int>(Schedule::SMEM_BYTES)) == cudaSuccess;
+        }();
+        if (!carveout_ok) {
+            throw std::runtime_error("W8 rowsplit shared-memory carveout is unavailable");
+        }
+    }
     w8_rowsplit_gemm_mma_kernel<Schedule, Full, W8Epilogue::Store, Output>
-        <<<grid, Schedule::THREADS, 0, stream>>>(
+        <<<grid, Schedule::THREADS, dynamic_shared, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), output, Geometry::kOutputRows,

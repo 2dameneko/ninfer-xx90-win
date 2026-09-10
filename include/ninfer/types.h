@@ -33,6 +33,13 @@ enum class KvCacheStorage : std::uint8_t {
     Fp8E4M3Row256,
     Nvfp4Group16,
     Fp8KeyNvfp4Value,
+    // Rotated/packed int8-family modes (port from the 4090 fork): K and V are rotated per
+    // 64-group by an H64 transform before encoding; packed modes store two signed 4-bit
+    // codes per byte. E8 variants replace V decoding with an E8 lattice/root codebook.
+    RotatedInt8KeyInt4ValueGroup64,
+    RotatedInt4KeyInt4ValueGroup64,
+    RK4V4E8,
+    RK2V4E8,
 };
 
 enum class EnginePurpose : std::uint8_t {
@@ -151,7 +158,9 @@ struct ContextCostOptions {
 struct EngineOptions {
     std::filesystem::path artifact_path;
     EnginePurpose purpose              = EnginePurpose::Generation;
-    int device                         = 0;
+    // CUDA device ordinal, or -1 to auto-select the first device whose architecture this build
+    // was compiled for.
+    int device                         = -1;
     std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     std::uint32_t max_concurrency      = 1;

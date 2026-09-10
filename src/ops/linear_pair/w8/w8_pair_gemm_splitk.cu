@@ -2,6 +2,7 @@
 #include "ops/linear_pair/w8/w8_pair_plan.h"
 
 #include "core/device.h"
+#include "core/device_capability.h"
 #include "ops/linear/w8/w8_small_t_mma.cuh"
 #include "ops/linear/w8/w8_rowsplit_gemm_medium_t_splitk.cuh"
 
@@ -74,8 +75,23 @@ void launch_active_cols(const Tensor& x, const Weight& first_weight, const Weigh
     const W8ContiguousOutput ignored{static_cast<__nv_bfloat16*>(first_out.data), kRows};
     const W8PairExactTEpilogue epilogue{static_cast<__nv_bfloat16*>(first_out.data),
                                         static_cast<__nv_bfloat16*>(second_out.data)};
+    const std::size_t dynamic_shared = core::dynamic_shared_carveout(
+        sizeof(W8SmallTMmaSharedStorage<Schedule>));
+    if (dynamic_shared != 0) {
+        static const bool carveout_ok = [] {
+            return cudaFuncSetAttribute(
+                       w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule, W8ContiguousOutput,
+                                             W8PairExactTEpilogue, W8PairExactTRows>,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       static_cast<int>(sizeof(W8SmallTMmaSharedStorage<Schedule>))) == cudaSuccess;
+        }();
+        if (!carveout_ok) {
+            throw std::runtime_error("W8 small-T shared-memory carveout is unavailable");
+        }
+    }
     w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule, W8ContiguousOutput, W8PairExactTEpilogue,
-                          W8PairExactTRows><<<kRows / kRowsPerCta, Schedule::kThreads, 0, stream>>>(
+                          W8PairExactTRows>
+        <<<kRows / kRowsPerCta, Schedule::kThreads, dynamic_shared, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), first_codes, first_scales, ignored, epilogue,
         W8PairExactTRows{});
 }
@@ -127,6 +143,29 @@ void w8_pair_splitk_medium_launch(W8PairScheduleId schedule, const Tensor& x,
     if (x.ne[0] != kHidden || x.ne[1] < 33 || first_out.ne[0] != kRows ||
         first_out.ne[1] != x.ne[1] || second_out.ne[0] != kRows || second_out.ne[1] != x.ne[1]) {
         throw std::invalid_argument("W8 medium pair requires [1024,2048] and T>=33");
+    }
+    if (!core::device_supports_sm100_or_newer()) {
+        // Pre-Blackwell SASS has no medium pair split-K kernels (48KB per-block shared-memory
+        // limit); the exact-T launchers cover the range via <=32-column chunking.
+        (void)schedule;
+        std::int32_t offset = 0;
+        while (offset < x.ne[1]) {
+            const std::int32_t count =
+                x.ne[1] - offset < kLastExactT ? x.ne[1] - offset : kLastExactT;
+            const Tensor x_slice      = x.slice(1, offset, count);
+            Tensor first_slice        = first_out.slice(1, offset, count);
+            Tensor second_slice       = second_out.slice(1, offset, count);
+            if (count == 1) {
+                w8_pair_decode_r16_launch(x_slice, first_weight, second_weight, first_slice,
+                                          second_slice, stream);
+            } else {
+                kLaunchers[count - kFirstExactT](x_slice, first_weight, second_weight, first_slice,
+                                                 second_slice, stream);
+            }
+            offset += count;
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
     }
     switch (schedule) {
     case W8PairScheduleId::DualSplitKMediumC48:

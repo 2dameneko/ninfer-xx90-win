@@ -17,6 +17,46 @@ namespace ninfer {
 
 inline constexpr std::int32_t kPagedKVPageSize = 64;
 
+/**
+ * Rotated/packed KV-cache mode flags (RK/E8 storages). Derived from `KvCacheStorage`;
+ * carried through planning and snapshots, consumed by the append and attention kernels.
+ * All four RK modes rotate K and V per 64-group (H64) and store V as packed codes in a
+ * `head_dim/2` U8 plane; `packed_k` halves the K plane the same way; the E8 variants decode
+ * V through the E8 lattice (`e8_lattice`) or E8 root (`e8_root`) codebooks.
+ */
+struct KVCacheStorageFlags {
+    bool packed_v   = false;
+    bool rotate_k   = false;
+    bool rotate_v   = false;
+    bool packed_k   = false;
+    bool e8_lattice = false;
+    bool e8_root    = false;
+};
+
+[[nodiscard]] inline KVCacheStorageFlags kv_cache_storage_flags(KvCacheStorage storage) {
+    switch (storage) {
+    case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
+        return {.packed_v = true, .rotate_k = true, .rotate_v = true};
+    case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
+        return {.packed_v = true, .rotate_k = true, .rotate_v = true, .packed_k = true};
+    case KvCacheStorage::RK4V4E8:
+        return {.packed_v = true, .rotate_k = true, .rotate_v = true, .packed_k = true,
+                .e8_lattice = true};
+    case KvCacheStorage::RK2V4E8:
+        return {.packed_v = true, .rotate_k = true, .rotate_v = true, .e8_root = true};
+    default:
+        return {};
+    }
+}
+
+/** True for the int8-family storages: plain INT8 plus the rotated/packed RK and E8 modes. */
+[[nodiscard]] inline bool is_int8_family_kv_storage(KvCacheStorage storage) {
+    return storage == KvCacheStorage::Int8Group64 ||
+           storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
+           storage == KvCacheStorage::RotatedInt4KeyInt4ValueGroup64 ||
+           storage == KvCacheStorage::RK4V4E8 || storage == KvCacheStorage::RK2V4E8;
+}
+
 /** Non-owning, single-sequence view consumed by growing-cache Ops. */
 struct PagedKVLayerView {
     Tensor k_pages;

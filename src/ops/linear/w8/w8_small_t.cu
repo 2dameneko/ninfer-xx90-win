@@ -1,6 +1,7 @@
 #include "ops/linear/w8/w8_launch.h"
 
 #include "core/device.h"
+#include "core/device_capability.h"
 #include "ops/linear/w8/w8_config.h"
 #include "ops/linear/w8/w8_small_t_mma.cuh"
 
@@ -20,8 +21,21 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
 
     const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows};
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
+    const std::size_t dynamic_shared = core::dynamic_shared_carveout(
+        sizeof(W8SmallTMmaSharedStorage<Schedule>));
+    if (dynamic_shared != 0) {
+        static const bool carveout_ok = [] {
+            return cudaFuncSetAttribute(
+                       w8_small_t_mma_kernel<Geometry, ActiveTokens, Schedule, W8ContiguousOutput>,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       static_cast<int>(sizeof(W8SmallTMmaSharedStorage<Schedule>))) == cudaSuccess;
+        }();
+        if (!carveout_ok) {
+            throw std::runtime_error("W8 small-T shared-memory carveout is unavailable");
+        }
+    }
     w8_small_t_mma_kernel<Geometry, ActiveTokens, Schedule>
-        <<<kBlocks, Schedule::kThreads, 0, stream>>>(
+        <<<kBlocks, Schedule::kThreads, dynamic_shared, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), output);
@@ -40,9 +54,24 @@ void launch_vocabulary_tile(const Tensor& x, const Weight& weight, Tensor& out, 
     using Schedule = W8SmallTMmaSchedule<Capacity <= 32 ? 8 : 4, Capacity, 2,
                                          W8SmallTMmaScaleAccess::Shared>;
     const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows};
+    const std::size_t dynamic_shared = core::dynamic_shared_carveout(
+        sizeof(W8SmallTMmaSharedStorage<Schedule>));
+    if (dynamic_shared != 0) {
+        static const bool carveout_ok = [] {
+            return cudaFuncSetAttribute(
+                       w8_small_t_mma_kernel<Geometry, Capacity, Schedule, W8ContiguousOutput,
+                                             W8SmallTMmaStoreEpilogue, W8SmallTMmaIdentityRows,
+                                             false, true>,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       static_cast<int>(sizeof(W8SmallTMmaSharedStorage<Schedule>))) == cudaSuccess;
+        }();
+        if (!carveout_ok) {
+            throw std::runtime_error("W8 small-T shared-memory carveout is unavailable");
+        }
+    }
     w8_small_t_mma_kernel<Geometry, Capacity, Schedule, W8ContiguousOutput,
                           W8SmallTMmaStoreEpilogue, W8SmallTMmaIdentityRows, false, true>
-        <<<Geometry::kOutputRows / 16, Schedule::kThreads, 0, stream>>>(
+        <<<Geometry::kOutputRows / 16, Schedule::kThreads, dynamic_shared, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), output, W8SmallTMmaStoreEpilogue{},

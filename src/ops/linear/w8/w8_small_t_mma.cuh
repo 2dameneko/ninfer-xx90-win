@@ -99,7 +99,15 @@ w8_small_t_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restri
 
     using SharedStorage = W8SmallTMmaSharedStorage<Schedule>;
 
-    constexpr bool kDynamicShared = TiledColumns && ActiveCols > 64;
+    // Blackwell lifts the pre-Blackwell 48KB static shared limit; on sm_86/sm_89 the
+    // oversized instantiations use the dynamic carveout (host launchers pass the storage
+    // size, see core::dynamic_shared_carveout).
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 1200
+    constexpr bool kPreBlackwellLarge = sizeof(SharedStorage) > 49152;
+#else
+    constexpr bool kPreBlackwellLarge = false;
+#endif
+    constexpr bool kDynamicShared = (TiledColumns && ActiveCols > 64) || kPreBlackwellLarge;
     __shared__ __align__(
         16) unsigned char static_shared[kDynamicShared ? 1 : sizeof(SharedStorage)];
     extern __shared__ __align__(16) unsigned char dynamic_shared[];

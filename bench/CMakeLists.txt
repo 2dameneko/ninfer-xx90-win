@@ -82,7 +82,7 @@ target_include_directories(ninfer_bench PRIVATE
   ${PROJECT_SOURCE_DIR}/src
   ${PROJECT_SOURCE_DIR}/third_party)
 target_compile_definitions(ninfer_bench PRIVATE NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
-target_link_libraries(ninfer_bench PRIVATE ninfer_engine CUDA::cudart)
+target_link_libraries(ninfer_bench PRIVATE ninfer_engine ${NINFER_CUDART_TARGET})
 
 # Static context-cost calibrator. Transfer measurements call production Paged-KV copy primitives,
 # then release their synthetic fixtures before the public Engine optionally loads one real artifact
@@ -103,7 +103,7 @@ target_include_directories(ninfer_context_cost_bench PRIVATE
 target_compile_definitions(ninfer_context_cost_bench PRIVATE
   NINFER_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 target_link_libraries(ninfer_context_cost_bench PRIVATE
-  ninfer_engine ninfer_core CUDA::cudart)
+  ninfer_engine ninfer_core ${NINFER_CUDART_TARGET})
 
 # Native target-private MTP proposal/verification microbenchmark. It enters through the target
 # Program facade and executes the production round schedule over a real .ninfer artifact.

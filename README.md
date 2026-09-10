@@ -20,6 +20,75 @@ NInfer supports five artifact identities. The quick-start commands use Qwen3.8-2
 The artifact identity fixes the exact model and weight profile. Every artifact also embeds the
 tokenizer, chat template, and media frontend resources required by its registered target.
 
+## This fork — ninfer-xx90-win: all RTX xx90 cards in one universal binary
+
+Upstream NInfer targets the RTX 5090 (`sm_120a`) only. This fork, **ninfer-xx90-win**, keeps every
+route of the engine and adds a first-class Windows x64 build plus a universal binary that carries
+native SASS for all three RTX xx90 generations:
+
+| GPU | CUDA arch | Runs from the same binary |
+|---|---|---|
+| RTX 3090 | sm_86 | `groupwise-int` artifacts; BF16/INT8 and rotated/E8 packed KV storage |
+| RTX 4090 | sm_89 | `groupwise-int` artifacts; BF16/INT8 and rotated/E8 packed KV storage |
+| RTX 5090 | sm_120a | everything: both weight profiles plus the Blackwell-only FP8, NVFP4, and K8V4 KV-storage routes |
+
+Each CUDA translation unit is compiled once per architecture and every cubin is embedded in one
+binary: each card executes its own compile-time-tuned kernels at per-architecture peak speed — no
+PTX-JIT, no per-card builds, no performance compromise. Blackwell-exclusive KV-storage routes
+(`--kv-dtype fp8|nvfp4|k8v4`) are rejected at startup with an explicit error on older cards;
+the `nvfp4` weight profile additionally requires an RTX 5090: its linear kernels use Blackwell
+tensor-core MMA and TMA that have no sm_86/sm_89 image. On RTX 3090/4090 use `groupwise-int`.
+
+### How ninfer-xx90-win relates to upstream and the sibling ports
+
+| | CUDA arch | Weight profiles | KV storage | Speculative decoding |
+|---|---|---|---|---|
+| Upstream [Neroued/ninfer](https://github.com/Neroued/ninfer) | sm_120a | groupwise-int + nvfp4 | bf16/int8/fp8/nvfp4/k8v4 | mtp, dflash, dflash2 |
+| [Don-Chad/ninfer-3090](https://github.com/Don-Chad/ninfer-3090) | sm_86 | groupwise-int | bf16/int8 (fp8 is a stub that rejects at startup) | mtp, dflash |
+| [sergiuszm/ninfer-4090](https://github.com/sergiuszm/ninfer-4090) | sm_89 | groupwise-int | bf16/int8/fp8 plus rk8v4/rk4v4/rk4v4-e8/rk2v4-e8 | mtp, dflash |
+| **ninfer-xx90-win** | sm_86 + sm_89 + sm_120a in one binary | groupwise-int + nvfp4 (nvfp4 on RTX 5090 only) | all nine modes; fp8/nvfp4/k8v4 KV on RTX 5090 only | mtp, dflash, dflash2 |
+
+Build on Windows (MSVC + Ninja + CUDA 13.1 or newer) with the in-tree script:
+
+```bat
+build.bat                  :: universal binary: sm_86 + sm_89 + sm_120a (default)
+build.bat --arch native    :: only the architectures of the GPUs present on this machine
+build.bat --arch 89        :: single-architecture development build (faster rebuilds)
+build.bat --force          :: clean rebuild
+```
+
+The binaries land in `build-win\apps\`. On Linux the quick start below applies unchanged; the
+default architecture list is the same universal set.
+
+When a host has several GPUs, CUDA device numbers can differ from the `nvidia-smi` order. Pin the
+device explicitly (`CUDA_DEVICE_ORDER=PCI_BUS_ID` plus `CUDA_VISIBLE_DEVICES`, or `--device`
+resolved by PCI bus id) instead of trusting index order.
+
+### KV cache storage modes
+
+`--kv-dtype` selects the runtime KV-cache storage. The CLI (`ninfer`) and the server
+(`ninfer-serve`) accept all nine modes; `ninfer-perplexity` accepts only the five upstream names.
+Sizes are physical bytes per token and KV head at `head_dim = 256` (K and V together).
+
+| `--kv-dtype` | Key / value encoding | Bytes/token·head | Cards | Origin |
+|---|---|---:|---|---|
+| `bf16` | BF16 key, FP16 value | 1024 | all | upstream |
+| `int8` | INT8, FP16 scale per 64-group | 528 | all | upstream |
+| `fp8` | FP8-E4M3, per-row scale | 516 | 5090 | upstream |
+| `nvfp4` | NVFP4 G16 both sides | 288 | 5090 | upstream |
+| `k8v4` | FP8 key, NVFP4 value | 402 | 5090 | upstream |
+| `rk8v4` | H64-rotated INT8 key, packed INT4 value | 400 | all | RTX 4090 port |
+| `rk4v4` | H64-rotated packed INT4 both sides | 272 | all | RTX 4090 port |
+| `rk4v4-e8` | as `rk4v4`; value decoded through the E8 lattice codebook | 272 | all | RTX 4090 port |
+| `rk2v4-e8` | E8-root key codec at quarter extent; E8-lattice value | 208 | all | RTX 4090 port |
+
+The four `rk`/E8 modes are the rotated-packed codecs merged from the RTX 4090 sibling port: the
+Hadamard H64 rotation spreads activation outliers before the 4-bit clipping, and the E8
+lattice/root codebooks replace scalar value decoding, so accuracy is kept while the KV pool for a
+64K-token context shrinks from 2.06 GiB (`int8`) to 0.83 GiB (`rk2v4-e8`). They run on Ampere,
+Ada, and Blackwell alike, including CUDA Graph decode, MTP/DFlash speculative decoding,
+concurrent batches, and prefix reuse.
+
 ## Quick start
 
 NInfer requires 64-bit Linux, an NVIDIA GeForce RTX 5090, CUDA Toolkit 13.1 or newer, CMake 3.28 or
@@ -212,7 +281,8 @@ All registered model IDs support:
 - image, multi-image, video, and mixed multimodal messages;
 - chunked prefill, exact-batch CUDA Graph decode, and startup-bounded batched decode;
 - MTP speculative decoding with draft windows from one to five;
-- BF16, INT8, FP8, NVFP4, and K8V4 KV storage;
+- BF16, INT8, FP8, NVFP4, K8V4, and the rotated/packed E8 (`rk8v4`, `rk4v4`, `rk4v4-e8`,
+  `rk2v4-e8`) KV storage;
 - offline causal-perplexity scoring;
 - private and shared exact-prefix reuse with Device/Host State and KV retention;
 - model-aware sampling defaults and explicit sampler overrides;
@@ -263,6 +333,21 @@ Support is entirely voluntary. It is not a purchase or investment and does not c
 returns, promised services or features, or a role in project decisions. The project's direction,
 priorities, technical choices, and release schedule remain independently determined by the
 maintainer.
+
+## Acknowledgments
+
+**ninfer-xx90-win** builds on the upstream
+[Neroued/ninfer](https://github.com/Neroued/ninfer) engine and merges the compatibility work of two
+sibling ports of the same engine into one universal binary:
+
+- [sergiuszm/ninfer-4090](https://github.com/sergiuszm/ninfer-4090) by Sergiusz Michalik — the
+  RTX 4090 (`sm_89`) port, whose pre-Blackwell tensor-core and split-K fallback designs this fork
+  follows, and whose rotated/E8 KV codecs (`rk8v4`, `rk4v4`, `rk4v4-e8`, `rk2v4-e8`) are merged
+  into this fork;
+- [Don-Chad/ninfer-3090](https://github.com/Don-Chad/ninfer-3090) by Don-Chad, with contributions
+  by Warlax — the RTX 3090 (`sm_86`) port, source of Ampere compatibility and Windows build fixes.
+
+Thanks to the authors for making their ports available.
 
 ## License
 

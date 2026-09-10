@@ -1,3 +1,4 @@
+#include "core/saturating_arithmetic.h"
 #include "runtime/engine/context_cost.h"
 
 #include <nlohmann/json.hpp>
@@ -12,7 +13,11 @@
 #include <system_error>
 #include <utility>
 
-#include <unistd.h>
+#if defined(_WIN32)
+#    include <process.h>
+#else
+#    include <unistd.h>
+#endif
 
 namespace ninfer::runtime {
 
@@ -23,7 +28,14 @@ const std::vector<ContextCostMachinePreset>& compiled_context_cost_defaults();
 namespace {
 
 using Json = nlohmann::json;
-using U128 = unsigned __int128;
+
+#if defined(_WIN32)
+std::uint64_t current_process_id() noexcept {
+    return static_cast<std::uint64_t>(::GetCurrentProcessId());
+}
+#else
+std::uint64_t current_process_id() noexcept { return static_cast<std::uint64_t>(::getpid()); }
+#endif
 
 constexpr std::size_t direction_index(ContextTransferDirection direction) noexcept {
     return static_cast<std::size_t>(direction);
@@ -36,18 +48,19 @@ std::uint64_t saturating_add(std::uint64_t left, std::uint64_t right) noexcept {
 }
 
 std::uint64_t saturating_product(std::uint64_t left, std::uint64_t right) noexcept {
-    const U128 product = static_cast<U128>(left) * right;
-    return product > std::numeric_limits<std::uint64_t>::max()
-               ? std::numeric_limits<std::uint64_t>::max()
-               : static_cast<std::uint64_t>(product);
+    return core::saturating_multiply(left, right);
 }
 
 std::uint64_t q32_product_ns(std::uint64_t coefficient, std::uint64_t units) noexcept {
     if (coefficient == 0 || units == 0) { return 0; }
-    const U128 product        = static_cast<U128>(coefficient) * units;
-    const U128 maximum_scaled = static_cast<U128>(std::numeric_limits<std::uint64_t>::max()) << 32U;
-    if (product >= maximum_scaled) { return std::numeric_limits<std::uint64_t>::max(); }
-    return static_cast<std::uint64_t>((product + kContextCostQ32One - 1U) >> 32U);
+    const std::uint64_t high = core::multiply_high(coefficient, units);
+    const std::uint64_t low  = coefficient * units;
+    // A product at or above 2^96 cannot survive the Q32 rescaling inside 64 bits.
+    if (high >= kContextCostQ32One) { return std::numeric_limits<std::uint64_t>::max(); }
+    // 2^64 is a multiple of 2^32, so rounding the low half up is independent of the high half.
+    const std::uint64_t low_ceiling =
+        (low >> 32U) + ((low & (kContextCostQ32One - 1U)) != 0 ? 1ULL : 0ULL);
+    return (high << 32U) + low_ceiling;
 }
 
 void require_object(const Json& value, std::string_view context) {
@@ -296,7 +309,7 @@ void write_document_atomic(const std::filesystem::path& path, const Json& docume
     if (!path.parent_path().empty()) { std::filesystem::create_directories(path.parent_path()); }
 
     std::filesystem::path temporary = path;
-    temporary += ".tmp." + std::to_string(static_cast<long long>(::getpid())) + "." +
+    temporary += ".tmp." + std::to_string(current_process_id()) + "." +
                  std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
     try {
         {

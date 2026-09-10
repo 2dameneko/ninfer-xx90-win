@@ -28,7 +28,7 @@ std::int32_t causal_attention_chunk_tokens(std::int32_t q_heads, std::int32_t wi
     if (q_heads == 16) return 6;
     // Balance the two narrow BF16 chunks; INT8 benefits from 5+4/5 at long contexts.
     if (batch_size == 1 && ((storage == KvCacheStorage::BFloat16 && width >= 9 && width <= 12) ||
-                            (storage == KvCacheStorage::Int8Group64 && width >= 9 && width <= 10 &&
+                            (is_int8_family_kv_storage(storage) && width >= 9 && width <= 10 &&
                              envelope.max_visible_keys > 4096)))
         return (width + 1) / 2;
     return 8;
@@ -353,6 +353,10 @@ CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::i
                 prompt_limit = width <= 4 ? 128 : width <= 8 ? 256 : 640;
                 break;
             case KvCacheStorage::Int8Group64:
+            case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
+            case KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
+            case KvCacheStorage::RK4V4E8:
+            case KvCacheStorage::RK2V4E8:
                 prompt_limit = width <= 8 ? 0 : 256;
                 break;
             case KvCacheStorage::Fp8E4M3Row256:

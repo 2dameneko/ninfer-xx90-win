@@ -17,12 +17,24 @@
 #include <system_error>
 #include <utility>
 
-#include <unistd.h>
+#if defined(_WIN32)
+#    include <process.h>
+#else
+#    include <unistd.h>
+#endif
 
 namespace ninfer::serve {
 namespace {
 
 using Json = nlohmann::json;
+
+#if defined(_WIN32)
+std::uint64_t current_process_id() noexcept {
+    return static_cast<std::uint64_t>(::_getpid());
+}
+#else
+std::uint64_t current_process_id() noexcept { return static_cast<std::uint64_t>(::getpid()); }
+#endif
 
 template <class T>
 T monotonic_delta(T previous, T current) noexcept {
@@ -38,7 +50,7 @@ std::uint64_t unix_time_ms() {
 std::string new_server_instance_id() {
     const auto now    = std::chrono::system_clock::now().time_since_epoch();
     const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(now).count();
-    return "serve-" + std::to_string(static_cast<long long>(::getpid())) + '-' +
+    return "serve-" + std::to_string(current_process_id()) + '-' +
            std::to_string(micros);
 }
 
@@ -138,6 +150,14 @@ const char* kv_cache_name(ninfer::KvCacheStorage storage) {
         return "nvfp4";
     case ninfer::KvCacheStorage::Fp8KeyNvfp4Value:
         return "k8v4";
+    case ninfer::KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
+        return "rk8v4";
+    case ninfer::KvCacheStorage::RotatedInt4KeyInt4ValueGroup64:
+        return "rk4v4";
+    case ninfer::KvCacheStorage::RK4V4E8:
+        return "rk4v4-e8";
+    case ninfer::KvCacheStorage::RK2V4E8:
+        return "rk2v4-e8";
     }
     return "unknown";
 }

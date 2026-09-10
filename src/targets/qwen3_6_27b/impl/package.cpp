@@ -130,6 +130,12 @@ Package::Frontend Package::make_frontend(const LoadedModel& model, const EngineO
 Package::SequencePlanner Package::make_sequence_planner(DeviceContext& device,
                                                         const EngineOptions& options,
                                                         WeightsProfile weights_profile) {
+    if (weights_profile == WeightsProfile::Qwen36Nvfp4 ||
+        weights_profile == WeightsProfile::Qwen38Nvfp4) {
+        if (device.compute_capability() != 120) {
+            throw std::invalid_argument("NVFP4 weights require compute capability 12.0");
+        }
+    }
     return qwen3_6::make_sequence_planner<detail::Variant>(device, options, weights_profile);
 }
 

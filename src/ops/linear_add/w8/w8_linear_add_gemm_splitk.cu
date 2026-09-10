@@ -1,6 +1,7 @@
 #include "ops/linear_add/w8/w8_linear_add_kernels.h"
 
 #include "core/device.h"
+#include "core/device_capability.h"
 #include "ops/linear/w8/w8_small_t_mma.cuh"
 #include "ops/linear/w8/w8_rowsplit_gemm_medium_t_splitk.cuh"
 
@@ -40,9 +41,23 @@ void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& residual_
     static_assert((kRows % kRowsPerCta) == 0);
     auto* residual = static_cast<__nv_bfloat16*>(residual_out.data);
     const W8ContiguousOutput output{residual, kRows};
+    const std::size_t dynamic_shared = core::dynamic_shared_carveout(
+        sizeof(W8SmallTMmaSharedStorage<Schedule>));
+    if (dynamic_shared != 0) {
+        static const bool carveout_ok = [] {
+            return cudaFuncSetAttribute(
+                       w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule, W8ContiguousOutput,
+                                             W8SmallTMmaResidualEpilogue>,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       static_cast<int>(sizeof(W8SmallTMmaSharedStorage<Schedule>))) == cudaSuccess;
+        }();
+        if (!carveout_ok) {
+            throw std::runtime_error("W8 small-T shared-memory carveout is unavailable");
+        }
+    }
     w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule, W8ContiguousOutput,
                           W8SmallTMmaResidualEpilogue>
-        <<<kRows / kRowsPerCta, Schedule::kThreads, 0, stream>>>(
+        <<<kRows / kRowsPerCta, Schedule::kThreads, dynamic_shared, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), output, W8SmallTMmaResidualEpilogue{});
@@ -101,6 +116,33 @@ void w8_linear_add_medium_splitk_launch(const Tensor& x, const Weight& weight, T
     const std::int32_t t = x.ne[1];
     if ((weight.k != 4096 && weight.k != 6144) || t < 49 || t > 128) {
         throw std::invalid_argument("W8 linear_add medium split-K requires T=49..128");
+    }
+    if (!core::device_supports_sm100_or_newer()) {
+        // Pre-Blackwell SASS has no medium split-K kernels (48KB per-block shared-memory limit);
+        // the exact-T launchers cover the same T range via 32-column chunking.
+        constexpr int chunk = 32;
+        const auto* launchers =
+            weight.k == 6144 ? kK6144ProjectionLaunchers.data()
+                             : kK4096ProjectionLaunchers.data();
+        std::int32_t offset = 0;
+        while (t - offset >= chunk) {
+            const Tensor x_slice = x.slice(1, offset, chunk);
+            Tensor residual_slice = residual_out.slice(1, offset, chunk);
+            launchers[chunk - kFirstExactCols](x_slice, weight, residual_slice, stream);
+            offset += chunk;
+        }
+        const std::int32_t tail = t - offset;
+        if (tail == 1) {
+            const Tensor x_slice = x.slice(1, offset, 1);
+            Tensor residual_slice = residual_out.slice(1, offset, 1);
+            w8_linear_add_decode_r16_launch(x_slice, weight, residual_slice, stream);
+        } else if (tail >= 2) {
+            const Tensor x_slice = x.slice(1, offset, tail);
+            Tensor residual_slice = residual_out.slice(1, offset, tail);
+            launchers[tail - kFirstExactCols](x_slice, weight, residual_slice, stream);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
     }
     if (t <= 64) {
         dispatch_medium_shape<64, 8, 4, 1>(x, weight, residual_out, stream);

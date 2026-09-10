@@ -158,7 +158,9 @@ __launch_bounds__(kCausalPromptNvfp4Threads, 1) void causal_attention_prompt_nvf
     __syncthreads();
 
     if (tid < kCausalPromptNvfp4ProducerThreads) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
         asm volatile("setmaxnreg.dec.sync.aligned.u32 40;" : : : "memory");
+#endif
         const int producer_tid = tid;
         for (int kb = 0; kb < key_blocks; ++kb) {
             const std::uint32_t empty_phase = 1U ^ static_cast<std::uint32_t>(kb & 1);
@@ -179,7 +181,9 @@ __launch_bounds__(kCausalPromptNvfp4Threads, 1) void causal_attention_prompt_nvf
         return;
     }
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
     asm volatile("setmaxnreg.inc.sync.aligned.u32 232;" : : : "memory");
+#endif
     const int consumer_tid  = tid - kCausalPromptNvfp4ProducerThreads;
     const int consumer_warp = consumer_tid >> 5;
     const int gid           = lane >> 2;

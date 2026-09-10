@@ -642,7 +642,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     return out;
 }
 
-void validate_target_options(DeviceContext& device, const EngineOptions& options) {
+void validate_target_options(DeviceContext& device, const EngineOptions& options,
+                             WeightsProfile weights_profile) {
     if (options.max_context == 0 || options.max_context > Variant::maximum_context) {
         throw std::invalid_argument("max_context exceeds the variant native context capacity");
     }
@@ -701,8 +702,15 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
         }
         break;
     }
-    if (device.compute_capability() != 120) {
-        throw std::invalid_argument("Qwen3.6 family runtime requires compute capability 12.0");
+    if (device.compute_capability() < 86) {
+        throw std::invalid_argument("Qwen3.6 family runtime requires compute capability 8.6 or newer");
+    }
+    if (device.compute_capability() < 120 &&
+        (options.kv_cache == KvCacheStorage::Fp8E4M3Row256 ||
+         options.kv_cache == KvCacheStorage::Nvfp4Group16 ||
+         options.kv_cache == KvCacheStorage::Fp8KeyNvfp4Value)) {
+        throw std::invalid_argument(
+            "FP8, NVFP4, and K8V4 KV storage require compute capability 12.0 (RTX 5090)");
     }
 }
 
@@ -784,7 +792,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
 std::unique_ptr<qwen3_6::detail::SequencePlannerImpl<Variant>>
 make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
                            WeightsProfile weights_profile) {
-    validate_target_options(device, options);
+    validate_target_options(device, options, weights_profile);
     SequencePlanningInputs inputs{
         .weights_profile     = weights_profile,
         .capacity            = options.max_context,

@@ -208,6 +208,7 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
     Nvfp4W4a4MaterializedActivation activation, const std::uint8_t* __restrict__ weight_codes,
     const std::uint8_t* __restrict__ weight_scales, std::int32_t tokens, float alpha,
     Epilogue epilogue, OutputPolicy output, RowPolicy row_policy = {}) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 1200
     static_assert((Geometry::kInputRows % Schedule::kBlockK) == 0);
     static_assert((Geometry::kOutputRows % Schedule::kBlockN) == 0);
     static_assert(!PairRows || (Schedule::kBlockN % 2) == 0);
@@ -382,6 +383,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
             }
         }
     }
+#else
+    // NVFP4 GEMM requires Blackwell (the sequence planner rejects NVFP4 weights elsewhere); the
+    // pre-Blackwell SASS is a trap stub and must never be launched.
+    asm volatile("trap;");
+#endif
 }
 
 template <class Geometry, int Threads = 256>

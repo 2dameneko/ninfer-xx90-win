@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "core/device_capability.h"
 #include "ops/linear/w8/w8_small_t_mma.cuh"
 #include "ops/linear/w8/w8_rowsplit_gemm_medium_t_splitk.cuh"
 #include "ops/linear/w8/w8_launch.h"
@@ -39,8 +40,21 @@ void launch_active_cols(const Tensor& x, const Weight& weight, Tensor& out, cuda
     using Schedule = W8SmallTMmaSchedule<KWarps, TileCols, MinBlocks, ScaleAccess, ActivationCache>;
     static_assert((kRows % kRowsPerCta) == 0);
     const W8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), kRows};
+    const std::size_t dynamic_shared = core::dynamic_shared_carveout(
+        sizeof(W8SmallTMmaSharedStorage<Schedule>));
+    if (dynamic_shared != 0) {
+        static const bool carveout_ok = [] {
+            return cudaFuncSetAttribute(
+                       w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule, W8ContiguousOutput>,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       static_cast<int>(sizeof(W8SmallTMmaSharedStorage<Schedule>))) == cudaSuccess;
+        }();
+        if (!carveout_ok) {
+            throw std::runtime_error("W8 small-T shared-memory carveout is unavailable");
+        }
+    }
     w8_small_t_mma_kernel<Geometry, ActiveCols, Schedule>
-        <<<kRows / kRowsPerCta, Schedule::kThreads, 0, stream>>>(
+        <<<kRows / kRowsPerCta, Schedule::kThreads, dynamic_shared, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data),
             static_cast<const std::uint8_t*>(weight.qdata),
             static_cast<const std::uint8_t*>(weight.scales), output);
@@ -82,13 +96,11 @@ void launch_w8_exact_t_splitk(const Tensor& x, const Weight& w, Tensor& out, cud
     CUDA_CHECK(cudaGetLastError());
 }
 
-void launch_w8_exact_t_composite(const Tensor& x, const Weight& w, Tensor& out,
-                                 cudaStream_t stream) {
-    require_problem(x, w, out);
-    if (x.ne[1] < 33 || x.ne[1] > 127) {
-        throw std::invalid_argument("W8 exact-T composite requires T=33..127");
-    }
-
+namespace {
+// Chunks T into 32-column exact-T slices plus a decode/exact tail. Portable to every baked
+// architecture (small shared-memory footprint), shared by the composite route and by the
+// pre-Blackwell fallback of the medium-T split-K routes.
+void launch_w8_exact_t_chunks(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     std::int32_t offset = 0;
     while (x.ne[1] - offset >= 32) {
         const Tensor x_slice = x.slice(1, offset, 32);
@@ -107,6 +119,16 @@ void launch_w8_exact_t_composite(const Tensor& x, const Weight& w, Tensor& out,
         launch_w8_exact_t_splitk(x_slice, w, out_slice, stream);
     }
 }
+} // namespace
+
+void launch_w8_exact_t_composite(const Tensor& x, const Weight& w, Tensor& out,
+                                 cudaStream_t stream) {
+    require_problem(x, w, out);
+    if (x.ne[1] < 33 || x.ne[1] > 127) {
+        throw std::invalid_argument("W8 exact-T composite requires T=33..127");
+    }
+    launch_w8_exact_t_chunks(x, w, out, stream);
+}
 
 template <int TileCols, int KSplits, int NGroups, int MinBlocks>
 void launch_medium_route(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
@@ -123,6 +145,13 @@ void launch_w8_dflash_medium(const Tensor& x, const Weight& w, Tensor& out, cuda
     const int t = x.ne[1];
     if (t < 49 || t > 128) {
         throw std::invalid_argument("W8 DFlash medium route requires T=49..128");
+    }
+    if (!core::device_supports_sm100_or_newer()) {
+        // Pre-Blackwell SASS has no medium split-K kernels (48KB per-block shared-memory limit);
+        // the exact-T chunking covers the same T range.
+        launch_w8_exact_t_chunks(x, w, out, stream);
+        CUDA_CHECK(cudaGetLastError());
+        return;
     }
 
     if (t <= 64) {
@@ -151,6 +180,12 @@ void launch_w8_dflash_medium(const Tensor& x, const Weight& w, Tensor& out, cuda
 
 void launch_w8_medium_splitk_c144(const Tensor& x, const Weight& w, Tensor& out,
                                   cudaStream_t stream) {
+    require_problem(x, w, out);
+    if (!core::device_supports_sm100_or_newer()) {
+        launch_w8_exact_t_chunks(x, w, out, stream);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     launch_medium_route<144, 2, 9, 2>(x, w, out, stream);
 }
 
